@@ -2,7 +2,20 @@ use gasket::framework::*;
 use tracing::{info, instrument, warn};
 
 use crate::prelude::*;
-use crate::storage::applydb::{ApplyDB, UtxoRef};
+use crate::storage::applydb::{
+    ApplyDB,
+    UtxoRef
+};
+
+use pallas::{
+    applying::*,
+    ledger::{
+        traverse::{
+            MultiEraBlock,
+            MultiEraTx
+        }
+    }
+};
 
 pub type UpstreamPort = gasket::messaging::tokio::InputPort<RollEvent>;
 
@@ -35,14 +48,30 @@ impl Stage {
 impl Stage {
     #[instrument(skip_all)]
     fn apply_block(&mut self, cbor: &[u8]) -> Result<(), WorkerError> {
-        let block = pallas::ledger::traverse::MultiEraBlock::decode(cbor).or_panic()?;
+        let block = MultiEraBlock::decode(cbor).or_panic()?;
         let slot = block.slot();
         let hash = block.hash();
 
         let mut batch = self.applydb.start_block(slot);
 
-        for tx in block.txs() {
-            for consumed in tx.consumes() {
+        // TODO: populate utxos with an entry for each input in tx, mapping it to its corresponding
+        // TxOut.
+        let utxos: UTxOs = UTxOs::new();
+        let protocol_params: ProtocolParams = ProtocolParams;
+        for metx in block.txs() {
+            match &metx {
+                MultiEraTx::Byron(_) => {
+                    // TODO: implement filling of utxos by querying the DB.
+                    ()
+                },
+                // TODO: add support for other eras.
+                _ => (),
+            }
+            match validate(&metx, &utxos, &protocol_params) {
+                Ok(()) => (),
+                Err(err) => warn!("{:?}", err),
+            }
+            for consumed in metx.consumes() {
                 batch
                     .spend_utxo(*consumed.hash(), consumed.index())
                     // TODO: since we don't have genesis utxos, it's reasonable to get missed hits.
@@ -57,9 +86,9 @@ impl Stage {
                     .or_panic()?;
             }
 
-            for (idx, produced) in tx.produces() {
+            for (idx, produced) in metx.produces() {
                 let body = produced.encode();
-                batch.insert_utxo(tx.hash(), idx as u64, body);
+                batch.insert_utxo(metx.hash(), idx as u64, body);
             }
         }
 
@@ -81,7 +110,7 @@ impl Stage {
 
     #[instrument(skip_all)]
     fn undo_block(&mut self, cbor: &[u8]) -> Result<(), WorkerError> {
-        let block = pallas::ledger::traverse::MultiEraBlock::decode(cbor).or_panic()?;
+        let block = MultiEraBlock::decode(cbor).or_panic()?;
 
         let mut batch = self.applydb.start_block(block.slot());
 
